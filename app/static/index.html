@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JobTracker — Agent Arena</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>🎯 JobTracker</h1>
+    <p>Job Application Tracker Agent — Agent Arena</p>
+    <a href="/docs">API documentation</a>
+  </header>
+  <main>
+    <section>
+      <label for="model">Available model</label>
+      <select id="model"></select>
+      <button id="reset" type="button">New chat</button>
+      <div id="messages" aria-live="polite"></div>
+      <form id="chat">
+        <label for="task">Your request</label>
+        <textarea id="task" required maxlength="10000" placeholder="e.g. Show me all my applications, Add application to Google as SWE, Detect duplicates..."></textarea>
+        <button id="send">Send</button>
+      </form>
+    </section>
+    <aside>
+      <h2>Context and observations</h2>
+      <label for="external">Untrusted external note (optional)</label>
+      <textarea id="external" maxlength="10000" placeholder="Paste a recruiter email, job listing, etc. This is treated as untrusted data."></textarea>
+      <p id="memory">0 messages in this chat</p>
+      <pre id="observations">No observations yet.</pre>
+      <h2>Current run</h2>
+      <p id="status" role="status">Idle</p>
+      <pre id="trace">No tool calls yet.</pre>
+    </aside>
+  </main>
+  <footer>
+    Memory is temporary. Reloading starts a new chat. Never paste API keys into the interface.
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

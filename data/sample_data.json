@@ -1,0 +1,77 @@
+{
+  "note": "Sample job application data for the sandbox board. Not real records.",
+  "records": [
+    {
+      "id": "app-001",
+      "company": "Google",
+      "role": "Software Engineer",
+      "date_applied": "2026-09-01",
+      "status": "interview_scheduled",
+      "url": "https://careers.google.com/jobs/12345",
+      "notes": "Applied through referral. Phone screen completed."
+    },
+    {
+      "id": "app-002",
+      "company": "Microsoft",
+      "role": "Backend Developer",
+      "date_applied": "2026-09-05",
+      "status": "applied",
+      "url": "https://careers.microsoft.com/jobs/67890",
+      "notes": "Applied online."
+    },
+    {
+      "id": "app-003",
+      "company": "Amazon",
+      "role": "Cloud Engineer",
+      "date_applied": "2026-08-20",
+      "status": "rejected",
+      "url": "",
+      "notes": "Rejected after second round."
+    },
+    {
+      "id": "app-004",
+      "company": "Meta",
+      "role": "Full Stack Engineer",
+      "date_applied": "2026-09-10",
+      "status": "screening",
+      "url": "https://metacareers.com/jobs/11111",
+      "notes": "Recruiter screening call scheduled."
+    },
+    {
+      "id": "app-005",
+      "company": "Netflix",
+      "role": "Senior Software Engineer",
+      "date_applied": "2026-09-12",
+      "status": "applied",
+      "url": "",
+      "notes": ""
+    },
+    {
+      "id": "app-006",
+      "company": "Apple",
+      "role": "iOS Developer",
+      "date_applied": "2026-09-15",
+      "status": "offer_received",
+      "url": "https://jobs.apple.com/en-us/details/22222",
+      "notes": "Offer received. Evaluating compensation package."
+    },
+    {
+      "id": "app-007",
+      "company": "Stripe",
+      "role": "Backend Engineer",
+      "date_applied": "2026-09-08",
+      "status": "interviewed",
+      "url": "",
+      "notes": "Completed onsite. Waiting for feedback."
+    },
+    {
+      "id": "app-008",
+      "company": "Google",
+      "role": "Software Engineer",
+      "date_applied": "2026-09-18",
+      "status": "applied",
+      "url": "https://careers.google.com/jobs/99999",
+      "notes": "Different team than app-001."
+    }
+  ]
+}

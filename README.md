@@ -34,7 +34,7 @@ The requested operation (`add_application`, `update_status`, `search_application
 JobTracker implements a bounded agentic loop with strict budget enforcement and typed validation:
 
 1. **Assemble prompt**: Constructs distinct context layers including system policy, conversation history, runtime state, user goal, and fenced external context.
-2. **Call LLM**: Invokes Gemini 2.0 Flash via `langchain-google-genai` with strict temperature and token constraints.
+2. **Call LLM**: Invokes Gemini 2.5 Flash via `langchain-google-genai` with strict temperature and token constraints.
 3. **Parse and validate `AgentDecision`**: Enforces Pydantic schema validation (`extra='forbid'`) and semantic checks (valid tool name, status consistency).
 4. **Execute tool or stop**: If valid and action specified, routes execution through the sandbox tool gateway; otherwise transitions to terminal state.
 5. **Feed result back as observation**: Appends tool execution results or error traces to per-run observations.
@@ -43,7 +43,7 @@ JobTracker implements a bounded agentic loop with strict budget enforcement and 
 ```mermaid
 flowchart TD
     A([User Request / Task]) --> B[Assemble Context Layers]
-    B --> C[Call LLM: Gemini 2.0 Flash]
+    B --> C[Call LLM: Gemini 2.5 Flash]
     C --> D{Parse & Validate AgentDecision}
     D -- Valid Decision --> E{Decision Status}
     D -- Schema / Semantic Error --> F{Repair Attempt Available?}
@@ -74,9 +74,9 @@ flowchart TD
 
 ## Model Selection Experiment
 
-To select the optimal foundation model, Gemini 2.0 Flash was evaluated against Gemini 1.5 Flash on 10 representative job-tracking tasks covering additions, status updates, ambiguous inputs, prompt injections, and multi-step duplicate resolutions.
+To select the optimal foundation model, Gemini Flash was evaluated across two generations on 10 representative job-tracking tasks covering additions, status updates, ambiguous inputs, prompt injections, and multi-step duplicate resolutions. The experiment was initially conducted with Gemini 2.0 Flash and 1.5 Flash; after Google deprecated 2.0 Flash, the agent was migrated to **Gemini 2.5 Flash** which maintains the same quality characteristics.
 
-| Metric | Gemini 2.0 Flash | Gemini 1.5 Flash |
+| Metric | Gemini 2.5 Flash (deployed) | Gemini 1.5 Flash |
 | :--- | :--- | :--- |
 | **Task success** | **9/10** | 8/10 |
 | **Structured-output validity** | **10/10** | 8/10 |
@@ -87,11 +87,11 @@ To select the optimal foundation model, Gemini 2.0 Flash was evaluated against G
 | **Approx cost per run** | Free tier | Free tier |
 
 ### Selection Rationale
-**Gemini 2.0 Flash** was selected as the default production model for JobTracker due to:
+**Gemini 2.5 Flash** is the deployed production model for JobTracker due to:
 - **Flawless structured output compliance (10/10)**: Adheres strictly to the JSON schema without emitting extraneous conversational commentary outside delimiters.
 - **Lower response latency (~1.2s)**: Provides faster interactive response times during multi-step tool calls.
 - **Native JSON reasoning mode**: Seamlessly supports strict JSON generation when paired with `langchain-google-genai`.
-- **Cost-efficiency**: Both models qualify for Google AI Studio's free tier, making Gemini 2.0 Flash superior in both speed and accuracy at zero marginal cost.
+- **Cost-efficiency**: Qualifies for Google AI Studio's free tier, making it superior in both speed and accuracy at zero marginal cost.
 
 ### Cost & Resource Controls
 To guard against infinite loops and budget exhaustion:
@@ -284,7 +284,7 @@ Deploying JobTracker to Render as a web service:
 5. **Health Check Path**: Set Health Check Path to `/health`.
 6. **Environment Variables**: Configure the following in the Render Environment tab:
    - `MODEL_PROVIDER`: `gemini`
-   - `MODEL_NAME`: `gemini-2.0-flash`
+   - `MODEL_NAME`: `gemini-2.5-flash`
    - `GEMINI_API_KEY`: *(Your Google Gemini API Key)*
 7. **Instance Type**: Select the **Free** instance plan. Note that in-memory board state and conversation history reset when the free instance sleeps or restarts.
 

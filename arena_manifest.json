@@ -2,27 +2,26 @@
   "arena_version": "0.1",
   "agent_name": "JobTracker",
   "domain": "Job-Application Tracker",
-  "description": "Bounded agent that manages a sandbox job-application board: search, add, update status, detect duplicates, and summarise applications.",
+  "description": "Bounded agent that maintains a sandbox job-application board: search, add, update status with pipeline rules, detect duplicates, summarise and draft (never send) follow-ups.",
   "endpoint": "/arena/run",
   "health_endpoint": "/health",
   "implementation": "complete",
-  "tools": [
-    "search_applications",
-    "add_application",
-    "update_status",
-    "detect_duplicates",
-    "get_summary"
-  ],
-  "fault_types": [
-    "none",
-    "tool_timeout",
-    "malformed_tool_output",
-    "invalid_agent_decision"
-  ],
+  "tools": ["search_applications", "get_summary", "detect_duplicates", "add_application", "update_status", "draft_follow_up"],
+  "approval_required_actions": ["delete_application", "send_email", "submit_application"],
+  "fault_types": ["none", "tool_timeout", "malformed_tool_output", "invalid_agent_decision"],
+  "statuses": ["completed", "needs_clarification", "blocked", "approval_required", "tool_error", "contract_error", "budget_exceeded", "failed"],
+  "stop_reasons": ["goal_completed", "clarification_required", "out_of_scope_or_unsafe", "approval_required", "agent_reported_failure", "tool_retries_exhausted", "contract_repair_exhausted", "step_budget_reached", "token_budget_reached", "time_budget_reached", "no_progress_loop", "llm_unavailable", "model_not_configured", "internal_error"],
   "limits": {
     "max_steps": 6,
     "max_tool_retries": 2,
+    "max_repair_attempts": 2,
+    "tool_timeout_seconds": 2.5,
     "run_timeout_seconds": 40,
+    "max_output_tokens": 768,
+    "max_run_tokens": 40000,
+    "max_history_messages": 12,
     "max_response_bytes": 50000
-  }
+  },
+  "models": {"default": "gemini-3.1-flash-lite", "failover": ["gemini-3.5-flash-lite", "gemini-2.5-flash"]},
+  "state": "Arena runs are stateless: every request gets a fresh copy of data/sample_data.json."
 }

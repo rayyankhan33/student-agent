@@ -1,420 +1,375 @@
-"""Five sandbox tools for the Job-Application Tracker agent.
+"""Sandbox job board, tool registry and the tool-execution gateway.
 
-Each tool:
-  - Has typed inputs and outputs
-  - Validates business rules before mutation
-  - Returns a structured result dict
-
-All tool execution is routed through `execute_tool()` which acts as a gateway
-for Arena fault injection (tool_timeout, malformed_tool_output).
+* Board          — an isolated, in-memory sandbox (one per Arena run, one per chat
+                   session). Nothing ever touches a real system.
+* TOOL_REGISTRY  — every action the model may name, its typed argument model and
+                   its permission level ('auto' or 'approval_required').
+* execute_tool() — the only path to execution. Enforces the per-call timeout,
+                   validates the tool output contract, retries transient failures
+                   within policy and applies Arena fault injection.
 """
+from __future__ import annotations
+
 import asyncio
+import copy
 import json
 import logging
-from time import perf_counter
-from typing import Optional
+import re
+import zlib
+from dataclasses import dataclass, field
+from datetime import date
 from difflib import SequenceMatcher
+from functools import lru_cache
+from time import perf_counter
+from typing import Any, Callable, Literal, Optional
 
-from app.models import JobApplication, ToolTrace, VALID_STATUSES
+from pydantic import BaseModel, ValidationError
+
+from app.config import ROOT
+from app.models import (AddArgs, ApplicationIdArgs, DraftFollowUpArgs,
+                        EmailArgs, EmptyArgs, JobApplication, SearchArgs,
+                        SubmitArgs, ToolResult, ToolTrace, UpdateStatusArgs)
 
 log = logging.getLogger('tools')
 
-# ---------------------------------------------------------------------------
-# In-memory sandbox job board (per-process; reset on restart)
-# ---------------------------------------------------------------------------
-_board: list[JobApplication] = []
-_board_initialized = False
+
+# ===========================================================================
+# Sandbox board
+# ===========================================================================
+@lru_cache(maxsize=1)
+def _sample_records() -> tuple[dict, ...]:
+    data = json.loads((ROOT / 'data/sample_data.json').read_text(encoding='utf-8'))
+    return tuple(JobApplication(**r).model_dump() for r in data['records'])
 
 
-def _load_sample_data():
-    """Load sample data into the board on first use."""
-    global _board, _board_initialized
-    if _board_initialized:
-        return
-    _board_initialized = True
-    try:
-        from app.config import ROOT
-        data = json.loads((ROOT / 'data/sample_data.json').read_text())
-        for record in data.get('records', []):
-            try:
-                app = JobApplication(**record)
-                _board.append(app)
-            except Exception as e:
-                log.warning('Skipped invalid sample record: %s', e)
-    except Exception as e:
-        log.warning('Could not load sample data: %s', e)
+@dataclass
+class Board:
+    records: list[JobApplication] = field(default_factory=list)
+    outbox: list[dict] = field(default_factory=list)   # drafts only, never sent
+    next_id: int = 1
+
+    @classmethod
+    def from_sample(cls) -> 'Board':
+        records = [JobApplication(**copy.deepcopy(r)) for r in _sample_records()]
+        return cls(records=records, next_id=len(records) + 1)
+
+    def find(self, application_id: str) -> Optional[JobApplication]:
+        key = application_id.strip().lower()
+        return next((r for r in self.records if r.id.lower() == key), None)
+
+    def new_id(self) -> str:
+        while True:
+            candidate = f'app-{self.next_id:03d}'
+            self.next_id += 1
+            if not self.find(candidate):
+                return candidate
+
+    def overview(self) -> str:
+        """What the model sees up front: size only. Record facts must come from tools."""
+        return (f'{len(self.records)} application(s) on the board. Record details are NOT shown '
+                f'here: read them with search_applications / get_summary / detect_duplicates.')
+
+    def snapshot(self, limit: int = 25) -> str:
+        if not self.records:
+            return '(board is empty)'
+        lines = [f'{len(self.records)} application(s):']
+        for r in self.records[:limit]:
+            lines.append(f'- {r.id} | {r.company} | {r.role} | {r.status} | '
+                         f'applied {r.date_applied or "unknown"}')
+        if len(self.records) > limit:
+            lines.append(f'... {len(self.records) - limit} more (use search_applications)')
+        return '\n'.join(lines)
 
 
-def get_board_snapshot() -> str:
-    """Return a compact text summary of the current board for the LLM."""
-    _load_sample_data()
-    if not _board:
-        return "(Board is empty — no applications tracked yet)"
-    lines = [f"Total applications: {len(_board)}"]
-    for app in _board:
-        lines.append(
-            f"  [{app.id}] {app.company} — {app.role} | "
-            f"Status: {app.status} | Applied: {app.date_applied or 'N/A'}"
-        )
-    return "\n".join(lines)
+def _brief(r: JobApplication) -> dict:
+    return {'id': r.id, 'company': r.company, 'role': r.role,
+            'status': r.status, 'date_applied': r.date_applied}
 
 
-# ---------------------------------------------------------------------------
-# Tool implementations
-# ---------------------------------------------------------------------------
-
-def search_applications(
-    query: str = '',
-    status_filter: str = '',
-    company_filter: str = ''
-) -> dict:
-    """Search and filter job applications on the board."""
-    _load_sample_data()
-    results = list(_board)
-
-    if status_filter:
-        status_filter = status_filter.strip().lower()
-        if status_filter not in VALID_STATUSES:
-            return {
-                'success': False,
-                'error': f"Invalid status filter '{status_filter}'. "
-                         f"Valid: {VALID_STATUSES}"
-            }
-        results = [a for a in results if a.status == status_filter]
-
-    if company_filter:
-        company_lower = company_filter.strip().lower()
-        results = [a for a in results
-                   if company_lower in a.company.lower()]
-
-    if query:
-        query_lower = query.strip().lower()
-        results = [
-            a for a in results
-            if (query_lower in a.company.lower()
-                or query_lower in a.role.lower()
-                or query_lower in a.notes.lower()
-                or query_lower in a.id.lower())
-        ]
-
-    return {
-        'success': True,
-        'count': len(results),
-        'applications': [a.model_dump() for a in results]
-    }
+def _ok(summary: str, **data) -> dict:
+    return {'ok': True, 'summary': summary[:600], 'data': data}
 
 
-def add_application(
-    company: str,
-    role: str,
-    date_applied: str = '',
-    status: str = 'applied',
-    url: str = '',
-    notes: str = ''
-) -> dict:
-    """Add a new job application to the sandbox board."""
-    _load_sample_data()
-
-    # Validate required fields
-    if not company or not company.strip():
-        return {'success': False, 'error': 'Company name is required.'}
-    if not role or not role.strip():
-        return {'success': False, 'error': 'Role/position is required.'}
-
-    # Check for potential duplicates before adding
-    company_lower = company.strip().lower()
-    role_lower = role.strip().lower()
-    duplicates = [
-        a for a in _board
-        if a.company.lower() == company_lower and a.role.lower() == role_lower
-    ]
-
-    try:
-        app = JobApplication(
-            company=company.strip(),
-            role=role.strip(),
-            date_applied=date_applied.strip() if date_applied else '',
-            status=status.strip().lower() if status else 'applied',
-            url=url.strip() if url else '',
-            notes=notes.strip() if notes else ''
-        )
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
-
-    _board.append(app)
-
-    result = {
-        'success': True,
-        'application': app.model_dump(),
-        'message': f"Added application [{app.id}]: {app.company} — {app.role}"
-    }
-    if duplicates:
-        result['duplicate_warning'] = (
-            f"Warning: {len(duplicates)} existing application(s) found for "
-            f"the same company and role: "
-            f"{[d.id for d in duplicates]}"
-        )
-    return result
+def _fail(code: str, summary: str, **data) -> dict:
+    return {'ok': False, 'summary': summary[:600], 'data': data, 'error_code': code}
 
 
-def update_status(
-    application_id: str,
-    new_status: str,
-    notes: str = ''
-) -> dict:
-    """Update the status of an existing application."""
-    _load_sample_data()
-
-    if not application_id or not application_id.strip():
-        return {'success': False,
-                'error': 'Application ID is required.'}
-    if not new_status or not new_status.strip():
-        return {'success': False,
-                'error': 'New status is required.'}
-
-    new_status_lower = new_status.strip().lower()
-    if new_status_lower not in VALID_STATUSES:
-        return {
-            'success': False,
-            'error': f"Invalid status '{new_status}'. "
-                     f"Valid: {VALID_STATUSES}"
-        }
-
-    app_id = application_id.strip().lower()
-    found = [a for a in _board if a.id.lower() == app_id]
-
-    if not found:
-        return {
-            'success': False,
-            'error': f"No application found with ID '{application_id}'."
-        }
-
-    app = found[0]
-    old_status = app.status
-    app.status = new_status_lower
-    if notes:
-        app.notes = (app.notes + ' | ' + notes.strip()) if app.notes else notes.strip()
-
-    return {
-        'success': True,
-        'application': app.model_dump(),
-        'message': (f"Updated [{app.id}] {app.company} — {app.role}: "
-                    f"{old_status} → {new_status_lower}")
-    }
+# ===========================================================================
+# Domain rules (semantic validation that needs board state)
+# ===========================================================================
+PIPELINE = ['saved', 'applied', 'screening', 'interview_scheduled',
+            'interviewed', 'offer_received', 'accepted']
+FINAL = {'accepted', 'rejected', 'withdrawn'}
 
 
-def detect_duplicates() -> dict:
-    """Find potential duplicate applications on the board."""
-    _load_sample_data()
-
-    if len(_board) < 2:
-        return {
-            'success': True,
-            'duplicates': [],
-            'message': 'Not enough applications to check for duplicates.'
-        }
-
-    duplicates = []
-    for i in range(len(_board)):
-        for j in range(i + 1, len(_board)):
-            a, b = _board[i], _board[j]
-            company_sim = SequenceMatcher(
-                None, a.company.lower(), b.company.lower()
-            ).ratio()
-            role_sim = SequenceMatcher(
-                None, a.role.lower(), b.role.lower()
-            ).ratio()
-
-            if company_sim > 0.8 and role_sim > 0.7:
-                duplicates.append({
-                    'app1': {'id': a.id, 'company': a.company,
-                             'role': a.role, 'status': a.status},
-                    'app2': {'id': b.id, 'company': b.company,
-                             'role': b.role, 'status': b.status},
-                    'company_similarity': round(company_sim, 2),
-                    'role_similarity': round(role_sim, 2)
-                })
-
-    return {
-        'success': True,
-        'duplicates': duplicates,
-        'message': (f"Found {len(duplicates)} potential duplicate pair(s)."
-                    if duplicates
-                    else "No duplicates detected.")
-    }
+def transition_error(old: str, new: str) -> Optional[str]:
+    if old == new:
+        return f'application is already "{old}"'
+    if old in FINAL:
+        return (f'"{old}" is a final status; reopening it needs explicit user '
+                f'approval')
+    if new in ('rejected', 'withdrawn'):
+        return None
+    if new == 'accepted' and old != 'offer_received':
+        return 'an application can only be "accepted" after "offer_received"'
+    if PIPELINE.index(new) < PIPELINE.index(old):
+        return f'moving backwards from "{old}" to "{new}" is not allowed'
+    return None
 
 
-def get_summary() -> dict:
-    """Get analytics and statistics about all tracked applications."""
-    _load_sample_data()
+_SUFFIXES = re.compile(r'\b(inc|llc|ltd|corp|corporation|co|company|plc|gmbh)\b\.?')
 
-    if not _board:
-        return {
-            'success': True,
-            'total': 0,
-            'by_status': {},
-            'by_company': {},
-            'message': 'No applications on the board yet.'
-        }
 
+def _norm(text: str) -> str:
+    text = _SUFFIXES.sub('', text.lower())
+    return ' '.join(re.sub(r'[^a-z0-9 ]+', ' ', text).split())
+
+
+def _similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+
+# ===========================================================================
+# Tools (pure functions over a Board; return dicts that must match ToolResult)
+# ===========================================================================
+def search_applications(board: Board, args: SearchArgs) -> dict:
+    rows = board.records
+    if args.status:
+        rows = [r for r in rows if r.status == args.status]
+    if args.company:
+        rows = [r for r in rows
+                if args.company.lower() in r.company.lower()
+                or _similar(args.company, r.company) > 0.85]
+    if args.query:
+        terms = args.query.lower().split()
+        rows = [r for r in rows
+                if all(t in f'{r.id} {r.company} {r.role} {r.notes}'.lower()
+                       for t in terms)]
+    return _ok(f'{len(rows)} matching application(s).', count=len(rows),
+               applications=[_brief(r) | {'notes': r.notes[:120]} for r in rows[:20]])
+
+
+def add_application(board: Board, args: AddArgs) -> dict:
+    dupes = [r for r in board.records
+             if _similar(r.company, args.company) > 0.85
+             and _similar(r.role, args.role) > 0.8]
+    if dupes and not args.allow_duplicate:
+        return _fail('possible_duplicate',
+                     'Not added: a similar application already exists. Ask the '
+                     'user to confirm before adding a duplicate.',
+                     existing=[_brief(r) for r in dupes])
+    record = JobApplication(id=board.new_id(), **args.model_dump(exclude={'allow_duplicate'}))
+    board.records.append(record)
+    return _ok(f'Added {record.id}: {record.company} — {record.role} ({record.status}).',
+               application=_brief(record))
+
+
+def update_status(board: Board, args: UpdateStatusArgs) -> dict:
+    record = board.find(args.application_id)
+    if not record:
+        return _fail('unknown_application',
+                     f'No application with id "{args.application_id}".')
+    problem = transition_error(record.status, args.new_status)
+    if problem:
+        return _fail('invalid_transition', f'Not updated: {problem}.',
+                     application=_brief(record))
+    old = record.status
+    record.status = args.new_status
+    if args.note:
+        record.notes = (f'{record.notes} | {args.note}' if record.notes else args.note)[:1000]
+    return _ok(f'{record.id} ({record.company} — {record.role}): {old} -> {record.status}.',
+               application=_brief(record))
+
+
+def detect_duplicates(board: Board, args: EmptyArgs) -> dict:
+    pairs = []
+    recs = board.records
+    for i in range(len(recs)):
+        for j in range(i + 1, len(recs)):
+            a, b = recs[i], recs[j]
+            c, r = _similar(a.company, b.company), _similar(a.role, b.role)
+            if c > 0.85 and r > 0.8:
+                pairs.append({'first': _brief(a), 'second': _brief(b),
+                              'company_similarity': round(c, 2),
+                              'role_similarity': round(r, 2)})
+    return _ok(f'{len(pairs)} possible duplicate pair(s).', pairs=pairs[:15])
+
+
+def get_summary(board: Board, args: EmptyArgs) -> dict:
     by_status: dict[str, int] = {}
-    by_company: dict[str, int] = {}
-
-    for app in _board:
-        by_status[app.status] = by_status.get(app.status, 0) + 1
-        by_company[app.company] = by_company.get(app.company, 0) + 1
-
-    return {
-        'success': True,
-        'total': len(_board),
-        'by_status': by_status,
-        'by_company': by_company,
-        'recent': [
-            {'id': a.id, 'company': a.company, 'role': a.role,
-             'status': a.status}
-            for a in _board[-5:]
-        ],
-        'message': f"Board has {len(_board)} application(s) across "
-                   f"{len(by_company)} companies."
-    }
+    for r in board.records:
+        by_status[r.status] = by_status.get(r.status, 0) + 1
+    today = date.today()
+    follow_up = []
+    for r in board.records:
+        if r.status in ('applied', 'interviewed') and r.date_applied:
+            try:
+                age = (today - date.fromisoformat(r.date_applied)).days
+            except ValueError:
+                continue
+            if age >= 14:
+                follow_up.append(_brief(r) | {'days_since_applied': age})
+    active = sum(v for k, v in by_status.items() if k not in FINAL)
+    return _ok(f'{len(board.records)} application(s), {active} active, '
+               f'{len(follow_up)} may need a follow-up.',
+               total=len(board.records), active=active, by_status=by_status,
+               needs_follow_up=follow_up[:10])
 
 
-# ---------------------------------------------------------------------------
-# Tool registry
-# ---------------------------------------------------------------------------
-TOOLS = {
-    'search_applications': search_applications,
-    'add_application': add_application,
-    'update_status': update_status,
-    'detect_duplicates': detect_duplicates,
-    'get_summary': get_summary,
-}
-
-# Actions that are blocked (autonomy boundary)
-BLOCKED_ACTIONS = {
-    'delete_all', 'delete_all_applications', 'clear_board',
-    'send_email', 'send_notification', 'export_data',
-    'access_external', 'scrape_website', 'apply_to_job',
-}
+def draft_follow_up(board: Board, args: DraftFollowUpArgs) -> dict:
+    record = board.find(args.application_id)
+    if not record:
+        return _fail('unknown_application',
+                     f'No application with id "{args.application_id}".')
+    draft = {'draft_id': f'draft-{len(board.outbox) + 1}', 'application_id': record.id,
+             'subject': args.subject, 'body': args.body, 'state': 'draft_not_sent'}
+    board.outbox.append(draft)
+    return _ok(f'Saved {draft["draft_id"]} for {record.company} in the sandbox outbox. '
+               f'It has NOT been sent.', draft=draft)
 
 
-# ---------------------------------------------------------------------------
-# Fault injection + tool execution gateway
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Registry
+# ===========================================================================
+Permission = Literal['auto', 'approval_required']
 
-async def execute_tool(
-    tool_name: str,
-    arguments: dict,
-    step: int,
-    fault_type: str = 'none',
-    fault_triggered: bool = False,
-    max_retries: int = 2,
-) -> tuple[dict, ToolTrace, bool]:
-    """Execute a tool with optional Arena fault injection.
 
-    Returns (result_dict, tool_trace, fault_was_triggered_now).
-    Handles retries internally up to max_retries.
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    args_model: type[BaseModel]
+    permission: Permission
+    fn: Optional[Callable[[Board, Any], dict]] = None
+    mutates: bool = False
+    safe_alternative: Optional[str] = None
+
+
+TOOL_REGISTRY: dict[str, ToolSpec] = {s.name: s for s in [
+    ToolSpec('search_applications', 'List or filter applications by free-text '
+             'query, status and/or company. Empty arguments list everything.',
+             SearchArgs, 'auto', search_applications),
+    ToolSpec('get_summary', 'Counts by status, active pipeline size and '
+             'applications that may need a follow-up.', EmptyArgs, 'auto', get_summary),
+    ToolSpec('detect_duplicates', 'Find likely duplicate applications '
+             '(same company and similar role).', EmptyArgs, 'auto', detect_duplicates),
+    ToolSpec('add_application', 'Add one application. company and role are '
+             'required and must come from the user or trusted task text. Set '
+             'allow_duplicate=true only if the user explicitly confirmed a duplicate.',
+             AddArgs, 'auto', add_application, mutates=True),
+    ToolSpec('update_status', 'Change the status of ONE application identified '
+             'by its exact id. Pipeline order is enforced.',
+             UpdateStatusArgs, 'auto', update_status, mutates=True),
+    ToolSpec('draft_follow_up', 'Write a follow-up email DRAFT into the sandbox '
+             'outbox. Never sends anything.', DraftFollowUpArgs, 'auto',
+             draft_follow_up, mutates=True),
+    # --- consequential actions: never executed autonomously ---------------
+    ToolSpec('delete_application', 'Permanently remove an application record.',
+             ApplicationIdArgs, 'approval_required'),
+    ToolSpec('send_email', 'Send a real email to a recruiter or company.',
+             EmailArgs, 'approval_required', safe_alternative='draft_follow_up'),
+    ToolSpec('submit_application', 'Submit a job application on an external site.',
+             SubmitArgs, 'approval_required', safe_alternative='add_application'),
+]}
+
+AUTO_TOOLS = [n for n, s in TOOL_REGISTRY.items() if s.permission == 'auto']
+RESTRICTED_TOOLS = [n for n, s in TOOL_REGISTRY.items() if s.permission != 'auto']
+
+
+def _signature(model: type[BaseModel]) -> str:
+    parts = []
+    for name, f in model.model_fields.items():
+        text = str(f.annotation)
+        ann = 'status' if 'Literal' in text else getattr(f.annotation, '__name__', text)
+        parts.append(f'{name}{"" if f.is_required() else "?"}: {ann}')
+    return '{' + ', '.join(parts) + '}'
+
+
+def tool_catalog(permission: Permission) -> str:
+    lines = []
+    for spec in TOOL_REGISTRY.values():
+        if spec.permission == permission:
+            lines.append(f'- {spec.name} {_signature(spec.args_model)} — {spec.description}')
+    return '\n'.join(lines)
+
+
+# ===========================================================================
+# Fault injection (Arena) — fires once, on the first matching operation
+# ===========================================================================
+class FaultInjector:
+    TOOL_FAULTS = ('tool_timeout', 'malformed_tool_output')
+
+    def __init__(self, fault_type: str, seed: str = ''):
+        self.fault_type = fault_type
+        self.fired = False
+        self.seed = seed
+
+    def take(self, kind: str) -> bool:
+        if self.fault_type == kind and not self.fired:
+            self.fired = True
+            return True
+        return False
+
+
+_MALFORMED_PAYLOADS = [
+    '<html><body>502 Bad Gateway</body></html>',
+    {'ok': 'maybe', 'rows': None},
+    {'summary': '', 'data': 'not-a-dict', 'unexpected': True},
+    None,
+]
+
+
+# ===========================================================================
+# Gateway
+# ===========================================================================
+@dataclass
+class ToolOutcome:
+    result: Optional[ToolResult]        # None => every attempt failed
+    traces: list[ToolTrace]
+    failure: Optional[str] = None       # 'timeout' | 'malformed_output' | 'exception'
+
+
+async def execute_tool(spec: ToolSpec, args: BaseModel, board: Board, step: int,
+                       faults: FaultInjector, max_retries: int,
+                       timeout_s: float) -> ToolOutcome:
+    """Run an *auto* tool with timeout, output validation and bounded retries.
+
+    Deterministic business-rule failures (ok=False) are returned immediately and
+    never retried; only transient failures (timeout, exception, malformed
+    output) are retried, at most `max_retries` extra times.
     """
-    # Check autonomy boundary
-    if tool_name in BLOCKED_ACTIONS:
-        trace = ToolTrace(
-            step=step, tool=tool_name, attempt=1, outcome='rejected'
-        )
-        return (
-            {'success': False,
-             'error': f"Action '{tool_name}' is blocked. This action is "
-                      f"outside the agent's permitted authority."},
-            trace,
-            False
-        )
-
-    if tool_name not in TOOLS:
-        trace = ToolTrace(
-            step=step, tool=tool_name, attempt=1, outcome='rejected'
-        )
-        return (
-            {'success': False,
-             'error': f"Unknown tool '{tool_name}'. Available: "
-                      f"{list(TOOLS.keys())}"},
-            trace,
-            False
-        )
-
-    tool_fn = TOOLS[tool_name]
-    should_inject = (fault_type != 'none' and not fault_triggered)
-
-    for attempt in range(1, max_retries + 2):  # 1-indexed, up to max_retries+1
+    assert spec.permission == 'auto' and spec.fn is not None
+    traces: list[ToolTrace] = []
+    failure = None
+    for attempt in range(1, max_retries + 2):
         started = perf_counter()
+        inject_timeout = faults.take('tool_timeout')
+        inject_malformed = faults.take('malformed_tool_output')
+
+        async def call():
+            if inject_timeout:
+                await asyncio.sleep(timeout_s * 4)    # simulated hung dependency
+            if inject_malformed:
+                return _MALFORMED_PAYLOADS[zlib.crc32(faults.seed.encode()) % len(_MALFORMED_PAYLOADS)]
+            return spec.fn(board, args)
+
         try:
-            # Inject fault on first matching operation
-            if should_inject and attempt == 1:
-                if fault_type == 'tool_timeout':
-                    # Simulate a tool timeout
-                    await asyncio.sleep(6)
-                    raise TimeoutError("Tool execution timed out")
-                elif fault_type == 'malformed_tool_output':
-                    # Return garbage instead of real result
-                    latency = (perf_counter() - started) * 1000
-                    trace = ToolTrace(
-                        step=step, tool=tool_name, attempt=attempt,
-                        outcome='malformed_output', latency_ms=latency
-                    )
-                    return (
-                        {'__malformed__': True,
-                         'garbage': 'xK#!@not-json{{{'},
-                        trace,
-                        True
-                    )
-
-            # Normal execution
-            result = tool_fn(**arguments)
-            latency = (perf_counter() - started) * 1000
-            trace = ToolTrace(
-                step=step, tool=tool_name, attempt=attempt,
-                outcome='success', latency_ms=latency
-            )
-            return result, trace, (should_inject and attempt == 1)
-
-        except TimeoutError:
-            latency = (perf_counter() - started) * 1000
-            trace = ToolTrace(
-                step=step, tool=tool_name, attempt=attempt,
-                outcome='timeout', latency_ms=latency
-            )
-            if attempt <= max_retries:
-                log.warning('Tool %s attempt %d timed out, retrying...',
-                            tool_name, attempt)
-                should_inject = False  # Don't re-inject on retry
-                continue
-            return (
-                {'success': False,
-                 'error': f"Tool '{tool_name}' timed out after "
-                          f"{attempt} attempts."},
-                trace,
-                True
-            )
-
-        except Exception as e:
-            latency = (perf_counter() - started) * 1000
-            trace = ToolTrace(
-                step=step, tool=tool_name, attempt=attempt,
-                outcome='exception', latency_ms=latency
-            )
-            if attempt <= max_retries:
-                log.warning('Tool %s attempt %d failed: %s, retrying...',
-                            tool_name, attempt, e)
-                continue
-            return (
-                {'success': False,
-                 'error': f"Tool '{tool_name}' failed after {attempt} "
-                          f"attempts: {str(e)}"},
-                trace,
-                (should_inject and attempt == 1)
-            )
-
-    # Should not reach here, but safety fallback
-    return (
-        {'success': False, 'error': 'Unexpected tool execution state'},
-        ToolTrace(step=step, tool=tool_name, attempt=1, outcome='exception'),
-        False
-    )
+            raw = await asyncio.wait_for(call(), timeout=timeout_s)
+            result = ToolResult.model_validate(raw)     # tool-output contract
+            outcome = 'success'
+        except asyncio.TimeoutError:
+            outcome, result = 'timeout', None
+        except ValidationError:
+            outcome, result = 'malformed_output', None
+        except Exception as exc:                        # tool bug / dependency crash
+            log.warning('tool %s raised %s', spec.name, exc)
+            outcome, result = 'exception', None
+        traces.append(ToolTrace(step=step, tool=spec.name, attempt=attempt,
+                                outcome=outcome,
+                                latency_ms=round((perf_counter() - started) * 1000, 1)))
+        if result is not None:
+            return ToolOutcome(result=result, traces=traces)
+        failure = outcome
+        if attempt <= max_retries:
+            await asyncio.sleep(0.05 * attempt)         # small bounded backoff
+    return ToolOutcome(result=None, traces=traces, failure=failure)

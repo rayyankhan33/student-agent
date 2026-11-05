@@ -1,0 +1,33 @@
+{
+  "generated_at": "2026-11-05 09:50:07",
+  "passed": true,
+  "app_001_final_status": "interviewed",
+  "transcript": [
+    {
+      "user": "Move my Google software engineer application to interviewed",
+      "status": "needs_clarification",
+      "stop_reason": "clarification_required",
+      "agent": "I found two Google Software Engineer applications (app-001 and app-008). Which one would you like to move to 'interviewed'?",
+      "pending_goal": "Move my Google software engineer application to interviewed",
+      "tools": [
+        [
+          "search_applications",
+          "success"
+        ]
+      ]
+    },
+    {
+      "user": "app-001",
+      "status": "completed",
+      "stop_reason": "goal_completed",
+      "agent": "I have successfully updated your Google Software Engineer application (app-001) to 'interviewed'.",
+      "pending_goal": null,
+      "tools": [
+        [
+          "update_status",
+          "success"
+        ]
+      ]
+    }
+  ]
+}

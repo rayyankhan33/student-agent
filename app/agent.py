@@ -1,429 +1,474 @@
-"""Bounded agent loop for Job-Application Tracker.
+"""The bounded agent loop.
 
-This module implements the core agentic loop:
-  1. Assemble prompt (system policy + history + state + user goal + external context)
-  2. Call the LLM
-  3. Parse and validate the AgentDecision (schema + semantic)
-  4. Execute tool or stop
-  5. Feed result back as observation
-  6. Repeat until done or budget exhausted
+    observe -> assemble context -> model decides -> validate (schema + semantics)
+      -> policy gate -> execute tool via gateway -> observation -> repeat
 
-All model calls (including repair attempts) count against max_steps.
+The model only *proposes* an AgentDecision. The system owns:
+  * validation and bounded contract repair (max_repair_attempts)
+  * the autonomy gate (approval_required tools never execute)
+  * tool timeouts and retries (inside the gateway)
+  * no-progress detection (repeated identical calls)
+  * every stopping rule: steps, tokens, wall-clock time, repair budget, dependency failure
 """
+from __future__ import annotations
+
 import json
 import logging
-from time import perf_counter
+import re
+import zlib
+from dataclasses import dataclass, field
+from time import monotonic, perf_counter
+from typing import Any, Optional
+
+from pydantic import BaseModel, ValidationError
 
 from app.config import settings
-from app.models import (
-    AgentDecision, AgentState, ArenaResponse, Metrics, ToolTrace
-)
-from app.prompts import build_messages
-from app.tools import (
-    execute_tool, get_board_snapshot, TOOLS, BLOCKED_ACTIONS
-)
+from app.models import AgentDecision, ArenaResponse, Metrics, ToolTrace
+from app.prompts import build_messages, new_boundary
+from app.tools import (TOOL_REGISTRY, Board, FaultInjector, ToolSpec,
+                       execute_tool)
 
 log = logging.getLogger('agent')
 
 
-def _get_llm(model: str):
-    """Get a LangChain LLM instance for the given model name."""
+# ===========================================================================
+# Run state
+# ===========================================================================
+@dataclass
+class RunState:
+    request_id: str
+    task: str
+    model: str
+    max_steps: int
+    started: float = field(default_factory=monotonic)
+    step: int = 0
+    model_calls: int = 0
+    llm_failures: int = 0
+    repairs_used: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    observations: list[dict] = field(default_factory=list)
+    tool_calls: list[ToolTrace] = field(default_factory=list)
+    errors: list[dict] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)
+    done_summaries: list[str] = field(default_factory=list)
+    executed: dict[str, int] = field(default_factory=dict)   # call signature -> count
+    failed_tools: set[str] = field(default_factory=set)      # retries exhausted
+    unresolved_failure: bool = False                          # no success since a failure
+    grounding_refusals: int = 0
+    cost_usd: float = 0.0
+    models_used: list[str] = field(default_factory=list)
+    last_note: str = ''
+
+    def event(self, kind: str, **data):
+        entry = {'step': self.step, 'event': kind, **data}
+        self.events.append(entry)
+        log.info(json.dumps({'request_id': self.request_id, **entry}, default=str)[:1500])
+
+    def error(self, kind: str, detail: str, **data):
+        self.errors.append({'step': self.step, 'type': kind, 'detail': detail[:300], **data})
+
+
+# ===========================================================================
+# Model access
+# ===========================================================================
+_LLM_CACHE: dict[str, Any] = {}
+
+
+def get_llm(model: str):
+    if model in _LLM_CACHE:
+        return _LLM_CACHE[model]
     provider = settings.model_provider.lower()
+    if provider not in ('gemini', 'google'):
+        raise RuntimeError(f'Unsupported or unconfigured MODEL_PROVIDER "{provider}"')
+    if not settings.gemini_api_key:
+        raise RuntimeError('GEMINI_API_KEY is not set')
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    kwargs: dict[str, Any] = dict(
+        model=model,
+        google_api_key=settings.gemini_api_key,
+        temperature=0,
+        max_output_tokens=settings.max_output_tokens,
+        timeout=settings.llm_timeout_seconds,
+        max_retries=1,                         # one transport retry; loop adds no more
+        response_mime_type='application/json', # provider-native JSON mode
+    )
+    if model.startswith('gemini-2.5'):
+        kwargs['thinking_budget'] = 0          # hidden reasoning would eat the output budget
+    llm = ChatGoogleGenerativeAI(**kwargs)
+    _LLM_CACHE[model] = llm
+    return llm
 
-    if provider == 'gemini' or provider == 'google':
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
-            model=model,
-            google_api_key=settings.gemini_api_key,
-            temperature=0.1,
-            max_output_tokens=settings.max_output_tokens,
-        )
-    else:
-        raise ValueError(
-            f"Unsupported model provider: '{provider}'. "
-            f"Set MODEL_PROVIDER to 'gemini'."
-        )
+
+def _text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ''.join(p.get('text', '') if isinstance(p, dict) else str(p) for p in content)
+    return str(content)
 
 
-def _parse_decision(raw_text: str) -> AgentDecision:
-    """Parse and validate the LLM's raw text output into an AgentDecision.
+# ===========================================================================
+# Contract validation
+# ===========================================================================
+class ContractViolation(Exception):
+    pass
 
-    Handles cases where the model wraps JSON in markdown code fences.
-    """
-    text = raw_text.strip()
 
-    # Strip markdown code fences if present
-    if text.startswith('```'):
-        lines = text.split('\n')
-        # Remove first line (```json or ```) and last line (```)
-        if lines[-1].strip() == '```':
-            lines = lines[1:-1]
-        else:
-            lines = lines[1:]
-        text = '\n'.join(lines).strip()
-
-    # Try to find JSON object in the text
-    start = text.find('{')
-    end = text.rfind('}')
-    if start != -1 and end != -1 and end > start:
+def _extract_json(raw: str) -> dict:
+    text = raw.strip()
+    fenced = re.search(r'```(?:json)?\s*(.*?)```', text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    if not text.startswith('{'):
+        start, end = text.find('{'), text.rfind('}')
+        if start == -1 or end <= start:
+            raise ContractViolation('reply is not a JSON object')
         text = text[start:end + 1]
-
-    data = json.loads(text)
-    return AgentDecision.model_validate(data)
-
-
-def _inject_invalid_decision_fault(raw_text: str) -> str:
-    """Corrupt the model output to simulate an invalid_agent_decision fault."""
-    return '{"status": "INVALID_ENUM", "action": 999, "broken": true}'
-
-
-async def run_agent(request, history, model) -> ArenaResponse:
-    """Main bounded agent loop.
-
-    Args:
-        request: ArenaRequest with task, external_context, arena_config
-        history: list of LangChain messages from prior conversation turns
-        model: model name string
-
-    Returns:
-        ArenaResponse with status, final_response, steps, traces, etc.
-    """
-    state = AgentState(max_steps=request.arena_config.max_steps)
-    fault_type = request.arena_config.fault.type
-    fault_triggered = False  # Track if fault has been injected
-
-    # Check if model is configured
-    if model == 'unconfigured' or settings.model_provider == 'unconfigured':
-        return ArenaResponse(
-            request_id=request.request_id,
-            status='failed',
-            final_response='No model is configured. Set MODEL_PROVIDER and MODEL_NAME.',
-            stop_reason='no_model_configured',
-            events=[{'step': 0, 'event': 'agent_stop',
-                     'reason': 'no_model_configured'}]
-        )
-
     try:
-        llm = _get_llm(model)
-    except Exception as e:
-        return ArenaResponse(
-            request_id=request.request_id,
-            status='failed',
-            final_response=f'Failed to initialize model: {str(e)[:200]}',
-            stop_reason='model_init_error',
-            events=[{'step': 0, 'event': 'agent_stop',
-                     'reason': f'model_init_error: {str(e)[:100]}'}]
-        )
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ContractViolation(f'invalid JSON ({exc.msg} at char {exc.pos})') from None
+    if not isinstance(data, dict):
+        raise ContractViolation('top-level JSON value must be an object')
+    return data
 
-    # -------------------------------------------------------------------
-    # Main agent loop
-    # -------------------------------------------------------------------
-    while state.step_count < state.max_steps:
-        state.step_count += 1
-        step = state.step_count
 
-        state.events.append({
-            'step': step, 'event': 'loop_start',
-            'remaining': state.max_steps - step
-        })
+def _fmt(exc: ValidationError) -> str:
+    return '; '.join(f"{'.'.join(map(str, e['loc'])) or 'decision'}: {e['msg']}"
+                     for e in exc.errors()[:4])
 
-        # 1. Assemble prompt
-        board_snapshot = get_board_snapshot()
-        messages = build_messages(
-            task=request.task,
-            history=history,
-            external_context=request.external_context,
-            observations=state.observations,
-            board_snapshot=board_snapshot,
-            step=step,
-            max_steps=state.max_steps,
-        )
 
-        # 2. Call the LLM
+def validate_decision(raw: str) -> tuple[AgentDecision, Optional[ToolSpec], Optional[BaseModel]]:
+    """Schema validation, then semantic validation against the tool registry."""
+    data = _extract_json(raw)
+    try:
+        decision = AgentDecision.model_validate(data)
+    except ValidationError as exc:
+        raise ContractViolation(f'schema: {_fmt(exc)}') from None
+    if decision.status != 'continue':
+        return decision, None, None
+    spec = TOOL_REGISTRY.get(decision.action or '')
+    if spec is None:
+        raise ContractViolation(f'unknown action "{decision.action}". Allowed: '
+                                f'{", ".join(TOOL_REGISTRY)}')
+    if spec.permission != 'auto':
+        return decision, spec, None                # policy gate handles it; never executed
+    try:
+        args = spec.args_model.model_validate(decision.arguments)
+    except ValidationError as exc:
+        raise ContractViolation(f'arguments for {spec.name}: {_fmt(exc)}') from None
+    return decision, spec, args
+
+
+_CORRUPTIONS = [
+    'Sure! I will look into that for you right away.',                       # not JSON
+    '{"status": "proceed", "action": 42, "arguments": "all"}',               # wrong enum/types
+    '{"status": "continue", "action": null, "arguments": {}, "user_message": ""}',  # inconsistent
+    '{"status": "continue", "action": "search_applications", '
+    '"arguments": {"limit": "ten", "sort": true}}',                         # bad arguments
+]
+
+
+def corrupt_decision(request_id: str) -> str:
+    """Arena fault invalid_agent_decision: replace the first model reply."""
+    return _CORRUPTIONS[zlib.crc32(request_id.encode()) % len(_CORRUPTIONS)]
+
+
+# ===========================================================================
+# Response construction
+# ===========================================================================
+def _add_cost(state: RunState, model: str, tokens_in: int, tokens_out: int) -> None:
+    price = settings.price(model)
+    if price:
+        state.cost_usd += (tokens_in * price[0] + tokens_out * price[1]) / 1e6
+
+
+def _cost(state: RunState) -> Optional[float]:
+    return round(state.cost_usd, 6) if state.cost_usd else None
+
+
+def finish(state: RunState, status: str, stop_reason: str, message: str) -> ArenaResponse:
+    message = (message or '').strip() or f'Run stopped with status {status}.'
+    if len(message) > 1990:
+        message = message[:1987] + '...'
+    state.event('stop', status=status, stop_reason=stop_reason)
+    return ArenaResponse(
+        request_id=state.request_id, status=status, final_response=message,
+        steps=state.step, stop_reason=stop_reason, tool_calls=state.tool_calls,
+        errors=state.errors, events=state.events,
+        metrics=Metrics(latency_ms=round((monotonic() - state.started) * 1000, 1),
+                        model_calls=state.model_calls,
+                        input_tokens=state.input_tokens or None,
+                        output_tokens=state.output_tokens or None,
+                        estimated_cost_usd=_cost(state)))
+
+
+def budget_message(state: RunState, what: str) -> str:
+    done = '; '.join(s.rstrip('.') for s in state.done_summaries[-4:]) or 'no tool actions completed'
+    msg = f'Stopped: the {what} ran out before the request was finished. Completed so far: {done}.'
+    if state.last_note:
+        msg += f' Last plan: {state.last_note}'
+    return msg + ' You can ask again with a smaller request to continue.'
+
+
+# ===========================================================================
+# The loop
+# ===========================================================================
+TERMINAL = {
+    'completed': ('completed', 'goal_completed'),
+    'needs_clarification': ('needs_clarification', 'clarification_required'),
+    'blocked': ('blocked', 'out_of_scope_or_unsafe'),
+    'approval_required': ('approval_required', 'approval_required'),
+    'failed': ('failed', 'agent_reported_failure'),
+}
+
+
+def _ids_in(value) -> set[str]:
+    """Every application id mentioned in a (nested) observation payload."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k in ('id', 'application_id') and isinstance(v, str):
+                found.add(v.lower())
+            else:
+                found |= _ids_in(v)
+    elif isinstance(value, list):
+        for v in value:
+            found |= _ids_in(v)
+    return found
+
+
+def check_target(app_id: str, user_texts: list[str], observations: list[dict]) -> Optional[tuple[str, str, list]]:
+    """Semantic validation for actions on an EXISTING record.
+
+    The id must be grounded: named by the user (task, history, pending goal), or seen
+    in this run's observations. If the most recent observation that mentions it is a
+    search that matched several records, the target is ambiguous. Returns
+    (error_code, message, candidate_ids) or None when the target is acceptable.
+    """
+    key = app_id.strip().lower()
+    pattern = re.compile(rf'(?<![\w-]){re.escape(key)}(?![\w-])')
+    if any(pattern.search(t.lower()) for t in user_texts):
+        return None
+    for obs in reversed(observations):
+        if not obs.get('ok') or key not in _ids_in(obs.get('data', {})):
+            continue
+        if obs.get('tool') == 'search_applications' and obs['data'].get('count', 0) > 1:
+            ids = [a['id'] for a in obs['data'].get('applications', [])]
+            return ('ambiguous_target',
+                    f'Not executed: the search that found {app_id} matched {len(ids)} records '
+                    f'({", ".join(ids)}). Narrow the search with details the user gave, or ask '
+                    f'the user which one.', ids)
+        return None
+    return ('ungrounded_target',
+            f'Not executed: {app_id} was not named by the user and has not been looked up in '
+            f'this run. Use search_applications to identify the record first.', [])
+
+
+async def run_agent(request, *, state: RunState, board: Board, history: list | None = None,
+                    pending: dict | None = None, llm=None, llm_factory=None) -> ArenaResponse:
+    faults = FaultInjector(request.arena_config.fault.type, seed=request.request_id)
+    boundary = new_boundary()
+    history = history or []
+    feedback = ''
+    user_texts = [request.task] + [str(m.content) for m in history]
+    if pending:
+        user_texts += [pending.get('goal', ''), pending.get('question', '')]
+    state.event('run_start', model=state.model, max_steps=state.max_steps,
+                fault=faults.fault_type, external_items=len(request.external_context),
+                history_messages=len(history), pending_goal=bool(pending))
+
+    factory = llm_factory or (get_llm if llm is None else None)
+    fallbacks = ([m for m in settings.models() if m != state.model]
+                 if factory and settings.model_fallback else [])
+    switched = False
+    if llm is None:
         try:
-            llm_response = await llm.ainvoke(messages)
-            raw_text = llm_response.content
+            llm = factory(state.model)
+        except Exception as exc:
+            state.error('model_unavailable', str(exc))
+            return finish(state, 'failed', 'model_not_configured',
+                          'The language model is not configured on this server.')
+    state.models_used.append(state.model)
+
+    while True:
+        # ---------------- stopping rules owned by the system ----------------
+        if state.step >= state.max_steps:
+            return finish(state, 'budget_exceeded', 'step_budget_reached',
+                          budget_message(state, f'{state.max_steps}-step budget'))
+        if state.input_tokens + state.output_tokens >= settings.max_run_tokens:
+            return finish(state, 'budget_exceeded', 'token_budget_reached',
+                          budget_message(state, f'{settings.max_run_tokens}-token budget'))
+        remaining_time = settings.run_timeout_seconds - (monotonic() - state.started)
+        if remaining_time < 3:
+            return finish(state, 'budget_exceeded', 'time_budget_reached',
+                          budget_message(state, f'{settings.run_timeout_seconds:.0f}-second time budget'))
+
+        state.step += 1
+        messages = build_messages(
+            task=request.task, history=history, external_context=request.external_context,
+            observations=state.observations, board_snapshot=board.overview(),
+            step=state.step, max_steps=state.max_steps,
+            repairs_left=settings.max_repair_attempts - state.repairs_used,
+            boundary=boundary, pending=pending, feedback=feedback)
+
+        # ---------------- model call (a dependency that can fail) ----------
+        started = perf_counter()
+        try:
+            reply = await llm.ainvoke(messages)
+        except Exception as exc:
+            state.llm_failures += 1
             state.model_calls += 1
+            state.error('llm_call_failed', f'{type(exc).__name__}: {exc}', model=state.model)
+            state.event('llm_error', error=type(exc).__name__, model=state.model)
+            if fallbacks and not switched:
+                try:
+                    nxt = fallbacks[0]
+                    llm = factory(nxt)
+                    state.event('model_fallback', from_model=state.model, to_model=nxt)
+                    state.model, switched = nxt, True
+                    state.models_used.append(nxt)
+                    continue
+                except Exception as fexc:
+                    state.error('model_fallback_failed', str(fexc))
+            if state.llm_failures >= (3 if switched else 2):
+                return finish(state, 'failed', 'llm_unavailable',
+                              'The language model is unavailable right now, so the request '
+                              'could not be processed. No changes were made after the failure.')
+            continue
+        state.model_calls += 1
+        usage = getattr(reply, 'usage_metadata', None) or {}
+        t_in, t_out = int(usage.get('input_tokens') or 0), int(usage.get('output_tokens') or 0)
+        state.input_tokens += t_in
+        state.output_tokens += t_out
+        _add_cost(state, state.model, t_in, t_out)
+        raw = _text(reply.content)
+        state.event('llm_reply', model=state.model,
+                    latency_ms=round((perf_counter() - started) * 1000, 1),
+                    chars=len(raw), input_tokens=usage.get('input_tokens'),
+                    output_tokens=usage.get('output_tokens'))
 
-            # Track token usage if available
-            usage = getattr(llm_response, 'usage_metadata', None)
-            if usage:
-                state.total_input_tokens += getattr(
-                    usage, 'input_tokens', 0) or 0
-                state.total_output_tokens += getattr(
-                    usage, 'output_tokens', 0) or 0
+        if faults.take('invalid_agent_decision'):
+            raw = corrupt_decision(request.request_id)
+            state.event('fault_injected', fault='invalid_agent_decision')
 
-            state.events.append({
-                'step': step, 'event': 'llm_response',
-                'raw_length': len(raw_text),
-            })
+        # ---------------- contract gate --------------------------------------
+        try:
+            decision, spec, args = validate_decision(raw)
+        except ContractViolation as exc:
+            state.repairs_used += 1
+            state.error('contract_violation', str(exc))
+            state.event('validation', passed=False, detail=str(exc)[:200],
+                        repairs_used=state.repairs_used)
+            if state.repairs_used > settings.max_repair_attempts:
+                return finish(state, 'contract_error', 'contract_repair_exhausted',
+                              'The model kept returning decisions that violate the agent '
+                              'contract, so nothing further was executed. Please try again.')
+            feedback = str(exc)
+            continue
+        feedback = ''
+        if decision.reasoning or decision.user_message:
+            state.last_note = (decision.user_message or decision.reasoning)[:300]
+        state.event('validation', passed=True)
+        state.event('decision', status=decision.status, action=decision.action,
+                    arguments=decision.arguments, reasoning=decision.reasoning[:200])
 
-        except Exception as e:
-            log.error('LLM call failed at step %d: %s', step, e)
-            state.errors.append({
-                'step': step, 'error': 'llm_call_failed',
-                'detail': str(e)[:200]
-            })
-            state.events.append({
-                'step': step, 'event': 'llm_error',
-                'error': str(e)[:100]
-            })
-            # Try to continue if we have budget, otherwise fail
-            if state.step_count >= state.max_steps:
-                return _build_response(
-                    request.request_id, 'failed',
-                    'The model call failed and no budget remains to retry.',
-                    'llm_error', state
-                )
+        # ---------------- terminal decisions ---------------------------------
+        if decision.status != 'continue':
+            status, reason = TERMINAL[decision.status]
+            if decision.status in ('completed', 'failed') and state.unresolved_failure:
+                status, reason = 'tool_error', 'tool_retries_exhausted'
+            return finish(state, status, reason, decision.user_message)
+
+        # ---------------- autonomy gate --------------------------------------
+        if spec.permission != 'auto':
+            state.tool_calls.append(ToolTrace(step=state.step, tool=spec.name,
+                                              outcome='rejected'))
+            state.event('policy_gate', tool=spec.name, verdict='approval_required')
+            alt = (f' I can do the safe alternative instead ({spec.safe_alternative}) '
+                   f'if you ask.' if spec.safe_alternative else '')
+            note = f' {decision.user_message}' if decision.user_message else ''
+            return finish(state, 'approval_required', 'approval_required',
+                          f'"{spec.name}" is a consequential action outside my authority, so I '
+                          f'did not perform it. It needs explicit human approval outside this '
+                          f'agent.{alt}{note}')
+
+        # ---------------- no-progress guard ----------------------------------
+        signature = spec.name + json.dumps(args.model_dump(), sort_keys=True, default=str)
+        if spec.name in state.failed_tools:
+            return finish(state, 'tool_error', 'tool_retries_exhausted',
+                          f'The {spec.name} tool is failing repeatedly, so I stopped instead '
+                          f'of guessing. Completed so far: '
+                          f'{"; ".join(state.done_summaries) or "nothing"}.')
+        if state.executed.get(signature):
+            state.executed[signature] += 1
+            state.error('repeated_action', f'{spec.name} called again with identical arguments')
+            if state.executed[signature] > 2:
+                return finish(state, 'failed', 'no_progress_loop',
+                              'Stopped: the agent kept repeating the same action without '
+                              'making progress.')
+            state.observations.append({'step': state.step, 'tool': spec.name, 'ok': False,
+                                       'error_code': 'duplicate_call',
+                                       'summary': 'Not executed: identical call already made '
+                                                  'in this run. Use the earlier observation.'})
             continue
 
-        # 3. Parse and validate the decision
-        # Optionally inject invalid_agent_decision fault
-        if (fault_type == 'invalid_agent_decision'
-                and not fault_triggered):
-            raw_text = _inject_invalid_decision_fault(raw_text)
-            fault_triggered = True
-            state.events.append({
-                'step': step, 'event': 'fault_injected',
-                'fault': 'invalid_agent_decision'
-            })
-
-        decision = None
-        parse_error = None
-        try:
-            decision = _parse_decision(raw_text)
-        except Exception as e:
-            parse_error = str(e)
-
-        # If parsing failed, attempt one repair (counts as another step)
-        if decision is None:
-            state.errors.append({
-                'step': step, 'error': 'contract_parse_error',
-                'detail': parse_error[:200] if parse_error else 'unknown'
-            })
-            state.events.append({
-                'step': step, 'event': 'contract_violation',
-                'detail': parse_error[:100] if parse_error else 'unknown'
-            })
-
-            # Check if we have budget for a repair attempt
-            if state.step_count >= state.max_steps:
-                return _build_response(
-                    request.request_id, 'contract_error',
-                    'The model produced invalid output and no budget remains '
-                    'to retry.',
-                    'contract_repair_exhausted', state
-                )
-
-            # Repair attempt — re-call LLM with error feedback
-            state.step_count += 1
-            state.observations.append(
-                f"[REPAIR NEEDED] Your previous response was not valid JSON "
-                f"matching the required schema. Error: {parse_error[:200]}. "
-                f"Please respond with ONLY a valid JSON object matching the "
-                f"AgentDecision schema."
-            )
-
-            try:
-                repair_messages = build_messages(
-                    task=request.task,
-                    history=history,
-                    external_context=request.external_context,
-                    observations=state.observations,
-                    board_snapshot=board_snapshot,
-                    step=state.step_count,
-                    max_steps=state.max_steps,
-                )
-                repair_response = await llm.ainvoke(repair_messages)
-                raw_text = repair_response.content
-                state.model_calls += 1
-
-                usage = getattr(repair_response, 'usage_metadata', None)
-                if usage:
-                    state.total_input_tokens += getattr(
-                        usage, 'input_tokens', 0) or 0
-                    state.total_output_tokens += getattr(
-                        usage, 'output_tokens', 0) or 0
-
-                decision = _parse_decision(raw_text)
-                state.events.append({
-                    'step': state.step_count, 'event': 'contract_repaired'
-                })
-
-            except Exception as e2:
-                state.errors.append({
-                    'step': state.step_count, 'error': 'contract_repair_failed',
-                    'detail': str(e2)[:200]
-                })
-                return _build_response(
-                    request.request_id, 'contract_error',
-                    'The model failed to produce valid output after a repair '
-                    'attempt.',
-                    'contract_repair_exhausted', state
-                )
-
-        # 4. Act on the decision
-        state.events.append({
-            'step': state.step_count,
-            'event': 'decision',
-            'status': decision.status,
-            'action': decision.action,
-        })
-
-        # Terminal statuses — stop the loop
-        if decision.status in ('completed', 'needs_clarification',
-                               'blocked', 'failed', 'approval_required'):
-            # Map agent decision status to arena response status
-            arena_status = decision.status
-            stop_reason = f'agent_{decision.status}'
-
-            return _build_response(
-                request.request_id,
-                arena_status,
-                decision.user_message or f'Agent stopped: {decision.status}',
-                stop_reason,
-                state
-            )
-
-        # Status is "continue" — execute the tool
-        if decision.status == 'continue':
-            if not decision.action:
-                state.errors.append({
-                    'step': state.step_count,
-                    'error': 'no_action_with_continue',
-                    'detail': 'Decision status is "continue" but no action '
-                              'was specified.'
-                })
-                state.observations.append(
-                    '[ERROR] You set status="continue" but did not specify '
-                    'an action. Either provide an action or use a terminal '
-                    'status.'
-                )
+        # ---------------- semantic check: is the target record grounded? ----
+        target = getattr(args, 'application_id', None) if spec.mutates else None
+        if target:
+            problem = check_target(target, user_texts, state.observations)
+            if problem:
+                code, message, candidates = problem
+                state.grounding_refusals += 1
+                state.tool_calls.append(ToolTrace(step=state.step, tool=spec.name,
+                                                  outcome='rejected'))
+                state.error(code, message, tool=spec.name)
+                state.event('policy_gate', tool=spec.name, verdict=code, target=target)
+                if state.grounding_refusals >= 2:
+                    # The model keeps picking an unconfirmed record: the system asks instead.
+                    options = ', '.join(_describe(board, i) for i in candidates) or \
+                        'the application id (see "Show my applications")'
+                    return finish(state, 'needs_clarification', 'clarification_required',
+                                  f'I need to be sure which application you mean before changing '
+                                  f'anything. Which one: {options}?')
+                state.observations.append({'step': state.step, 'tool': spec.name, 'ok': False,
+                                           'error_code': code, 'summary': message})
                 continue
 
-            # Check autonomy boundary
-            if decision.action in BLOCKED_ACTIONS:
-                return _build_response(
-                    request.request_id,
-                    'approval_required',
-                    f"The action '{decision.action}' is outside the agent's "
-                    f"permitted authority. This would require human approval.",
-                    'autonomy_boundary',
-                    state
-                )
-
-            # Execute the tool through the fault-injection gateway
-            try:
-                tool_result, trace, newly_triggered = await execute_tool(
-                    tool_name=decision.action,
-                    arguments=decision.arguments,
-                    step=min(state.step_count, 6),
-                    fault_type=fault_type,
-                    fault_triggered=fault_triggered,
-                    max_retries=settings.max_tool_retries,
-                )
-                if newly_triggered:
-                    fault_triggered = True
-
-                state.tool_traces.append(trace)
-
-                # Check for malformed tool output
-                if isinstance(tool_result, dict) and tool_result.get(
-                        '__malformed__'):
-                    state.observations.append(
-                        f"[TOOL ERROR] Tool '{decision.action}' returned "
-                        f"malformed output. The data could not be parsed. "
-                        f"You may retry or choose a different approach."
-                    )
-                    state.events.append({
-                        'step': state.step_count,
-                        'event': 'tool_malformed_output',
-                        'tool': decision.action
-                    })
-                elif isinstance(tool_result, dict) and not tool_result.get(
-                        'success', True):
-                    error_msg = tool_result.get('error', 'Unknown tool error')
-                    state.observations.append(
-                        f"[TOOL RESULT] {decision.action}: Failed — {error_msg}"
-                    )
-                    state.events.append({
-                        'step': state.step_count,
-                        'event': 'tool_error',
-                        'tool': decision.action,
-                        'error': error_msg[:100]
-                    })
-                else:
-                    # Successful tool result
-                    result_summary = json.dumps(tool_result, default=str)
-                    if len(result_summary) > 2000:
-                        result_summary = result_summary[:2000] + '...'
-                    state.observations.append(
-                        f"[TOOL RESULT] {decision.action}: {result_summary}"
-                    )
-                    state.events.append({
-                        'step': state.step_count,
-                        'event': 'tool_success',
-                        'tool': decision.action,
-                    })
-
-            except Exception as e:
-                state.errors.append({
-                    'step': state.step_count, 'error': 'tool_execution_error',
-                    'tool': decision.action, 'detail': str(e)[:200]
-                })
-                state.observations.append(
-                    f"[TOOL ERROR] {decision.action} raised an exception: "
-                    f"{str(e)[:200]}"
-                )
-                state.events.append({
-                    'step': state.step_count,
-                    'event': 'tool_exception',
-                    'tool': decision.action,
-                    'error': str(e)[:100]
-                })
-
-    # -------------------------------------------------------------------
-    # Budget exhausted — loop exited naturally
-    # -------------------------------------------------------------------
-    return _build_response(
-        request.request_id,
-        'budget_exceeded',
-        state.observations[-1][:500] if state.observations
-        else 'Step budget exhausted before the task completed.',
-        'step_budget_reached',
-        state
-    )
+        # ---------------- execute through the gateway ------------------------
+        outcome = await execute_tool(spec, args, board, state.step, faults,
+                                     settings.max_tool_retries, settings.tool_timeout_seconds)
+        state.tool_calls.extend(outcome.traces)
+        for t in outcome.traces:
+            if t.outcome != 'success':
+                state.error(f'tool_{t.outcome}', f'{t.tool} attempt {t.attempt}: {t.outcome}',
+                            tool=t.tool, attempt=t.attempt)
+        if outcome.result is None:
+            state.failed_tools.add(spec.name)
+            state.unresolved_failure = True
+            obs = {'step': state.step, 'tool': spec.name, 'ok': False,
+                   'error_code': 'dependency_failure',
+                   'summary': f'{spec.name} failed {len(outcome.traces)} time(s) '
+                              f'({outcome.failure}). It is unavailable for the rest of this run.'}
+        else:
+            r = outcome.result
+            state.executed[signature] = 1
+            obs = {'step': state.step, 'tool': spec.name, 'arguments': args.model_dump(
+                exclude_defaults=True), 'ok': r.ok, 'summary': r.summary, 'data': r.data}
+            if r.error_code:
+                obs['error_code'] = r.error_code
+            state.unresolved_failure = False
+            if r.ok:
+                state.done_summaries.append(r.summary)
+        state.observations.append(obs)
+        data_preview = json.dumps(obs.get('data', {}), default=str)
+        state.event('observation', tool=spec.name, ok=obs['ok'],
+                    attempts=len(outcome.traces), summary=obs['summary'][:300],
+                    error_code=obs.get('error_code'),
+                    data=data_preview if len(data_preview) <= 700 else data_preview[:700] + '…')
 
 
-def _build_response(
-    request_id: str,
-    status: str,
-    final_response: str,
-    stop_reason: str,
-    state: AgentState,
-) -> ArenaResponse:
-    """Construct a valid ArenaResponse from the current agent state."""
-    # Ensure final_response is not empty
-    if not final_response or not final_response.strip():
-        final_response = f'Agent stopped with status: {status}'
-
-    # Truncate if needed
-    if len(final_response) > 1900:
-        final_response = final_response[:1900] + '...'
-
-    return ArenaResponse(
-        request_id=request_id,
-        status=status,
-        final_response=final_response,
-        steps=min(state.step_count, 6),
-        stop_reason=stop_reason,
-        tool_calls=state.tool_traces,
-        errors=state.errors,
-        events=state.events,
-        metrics=Metrics(
-            model_calls=min(state.model_calls, 6),
-            input_tokens=state.total_input_tokens or None,
-            output_tokens=state.total_output_tokens or None,
-            estimated_cost_usd=None,  # Free tier — no cost
-        ),
-    )
+def _describe(board: Board, app_id: str) -> str:
+    r = board.find(app_id)
+    return f'{r.id} ({r.company}, {r.role}, {r.status})' if r else app_id

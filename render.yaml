@@ -4,6 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
+    # One worker: chat memory and session boards live in process memory.
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     envVars:
@@ -12,6 +13,8 @@ services:
       - key: MODEL_PROVIDER
         value: gemini
       - key: MODEL_NAME
-        value: gemini-2.5-flash
+        value: gemini-3.1-flash-lite
+      - key: AVAILABLE_MODELS
+        value: gemini-3.5-flash-lite,gemini-2.5-flash
       - key: GEMINI_API_KEY
         sync: false

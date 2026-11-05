@@ -1,1 +1,46 @@
-*{box-sizing:border-box}body{margin:0;background:#f1f5f3;color:#183b30;font:16px/1.5 system-ui}header,main,footer{max-width:1100px;margin:auto;padding:24px}h1,h2{margin:0 0 12px}main{display:grid;grid-template-columns:1.3fr 1fr;gap:24px}section,aside{padding:24px;background:white;border:1px solid #d6e2dc;border-radius:12px}label{display:block;margin-top:12px}textarea,select{width:100%;padding:10px;border:1px solid #bacdc2;border-radius:6px}textarea{min-height:85px}button{padding:10px 18px;margin-top:10px;background:#20634a;color:white;border:0;border-radius:6px;cursor:pointer}button:disabled{opacity:.5}#messages{min-height:220px;max-height:420px;overflow:auto}article{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:#eef4ef;margin:10px 0;border-radius:8px}article.user{background:#d6edde}pre{font:13px/1.5 monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:280px;overflow:auto}footer{font-size:13px}@media(max-width:750px){main{grid-template-columns:1fr}}
+:root{--bg:#f4f6f5;--card:#fff;--ink:#1b2a24;--muted:#61706a;--line:#d8e0dc;--accent:#1f6b52;--warn:#a15c00;--bad:#b42318}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
+header,main,footer{max-width:1200px;margin:auto;padding:16px}
+header{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:end}
+h1{margin:0;font-size:24px}h2{font-size:15px;margin:18px 0 6px}
+header p{margin:2px 0;color:var(--muted)}
+a{color:var(--accent)}
+.controls{display:flex;gap:8px;align-items:center}
+main{display:grid;grid-template-columns:1.25fr 1fr;gap:16px}
+section,aside{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;min-width:0}
+#messages{min-height:300px;max-height:55vh;overflow:auto}
+article{padding:10px 12px;margin:8px 0;border-radius:8px;background:#eef3f0}
+article.user{background:#e2efe8}
+article p{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
+label{display:block;margin-top:10px;font-size:13px;color:var(--muted)}
+textarea,select,input{width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;font:inherit}
+select{width:auto}
+textarea{min-height:70px}
+button{padding:8px 16px;margin-top:10px;background:var(--accent);color:#fff;border:0;border-radius:6px;cursor:pointer;font:inherit}
+button.secondary{background:#fff;color:var(--accent);border:1px solid var(--accent);margin:0}
+button:disabled{opacity:.5}
+details{margin-top:10px}
+.tag,.badge{display:inline-block;margin-left:8px;padding:0 8px;border-radius:99px;font-size:12px;background:#e5e7eb}
+.badge{margin:0;font-size:13px}
+.completed{background:#d1fadf}.needs_clarification,.running{background:#fef0c7}
+.approval_required,.blocked{background:#fde2c8}
+.failed,.tool_error,.contract_error,.budget_exceeded{background:#fee4e2}
+.muted,.hint{color:var(--muted)}
+.timeline{padding-left:18px;margin:0;font-size:13px;max-height:300px;overflow:auto}
+.timeline li{margin:3px 0;overflow-wrap:anywhere}
+.timeline li.warn{color:var(--warn)}
+.timeline li.stop{font-weight:600}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:3px 6px;border-bottom:1px solid var(--line)}
+pre{font:12px/1.4 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto}
+footer{font-size:13px;color:var(--muted)}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+.scenario{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding-bottom:10px;border-bottom:1px solid var(--line);margin-bottom:8px}
+.scenario label{margin:0}.scenario select{flex:1;min-width:200px}.scenario p{flex-basis:100%;margin:0;font-size:13px}
+.row{display:flex;flex-wrap:wrap;gap:12px;align-items:center}.row label{margin:6px 0}
+.row input[type=number]{width:70px}.check{display:flex;gap:6px;align-items:center}.check input{width:auto}
+.small{font-size:12px;font-weight:normal}
+.obs summary{font-size:13px;cursor:pointer;overflow-wrap:anywhere}.obs summary.warn{color:var(--warn)}
+.timeline li.bad{color:var(--bad)}.timeline li.model_fallback,.timeline li.llm_error{color:var(--warn)}
+article.System{background:#f3f4f6}

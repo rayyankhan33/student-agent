@@ -3,41 +3,69 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>JobTracker — Agent Arena</title>
+  <title>JobTracker Agent</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header>
-    <h1>🎯 JobTracker</h1>
-    <p>Job Application Tracker Agent — Agent Arena</p>
-    <a href="/docs">API documentation</a>
-  </header>
-  <main>
-    <section>
-      <label for="model">Available model</label>
-      <select id="model"></select>
-      <button id="reset" type="button">New chat</button>
-      <div id="messages" aria-live="polite"></div>
-      <form id="chat">
-        <label for="task">Your request</label>
-        <textarea id="task" required maxlength="10000" placeholder="e.g. Show me all my applications, Add application to Google as SWE, Detect duplicates..."></textarea>
-        <button id="send">Send</button>
-      </form>
-    </section>
-    <aside>
-      <h2>Context and observations</h2>
-      <label for="external">Untrusted external note (optional)</label>
-      <textarea id="external" maxlength="10000" placeholder="Paste a recruiter email, job listing, etc. This is treated as untrusted data."></textarea>
-      <p id="memory">0 messages in this chat</p>
-      <pre id="observations">No observations yet.</pre>
-      <h2>Current run</h2>
-      <p id="status" role="status">Idle</p>
-      <pre id="trace">No tool calls yet.</pre>
-    </aside>
-  </main>
-  <footer>
-    Memory is temporary. Reloading starts a new chat. Never paste API keys into the interface.
-  </footer>
-  <script src="/static/app.js"></script>
+<header>
+  <div>
+    <h1>JobTracker</h1>
+    <p>Bounded job-application tracking agent (sandbox board) · <a href="/docs">API docs</a> · <a href="/arena/manifest">manifest</a> · <a href="/health">health</a></p>
+  </div>
+  <div class="controls">
+    <label for="model">Model</label>
+    <select id="model"></select>
+    <button id="reset" type="button" class="secondary">New chat</button>
+  </div>
+</header>
+<main>
+  <section class="chat">
+    <div class="scenario">
+      <label for="scenario">Demo scenario</label>
+      <select id="scenario"><option value="">— pick a scenario to load it —</option></select>
+      <button id="runScenario" type="button" class="secondary" disabled>Run scenario</button>
+      <p id="expected" class="muted"></p>
+    </div>
+    <div id="messages" aria-live="polite"><p class="hint">Try: “Show my summary”, “Add Shopify, Data Analyst, applied today”, “Mark my Google application as interviewed”, “Delete all my applications”.</p></div>
+    <form id="chat">
+      <label for="task">Message</label>
+      <textarea id="task" required maxlength="10000" placeholder="What should the agent do?"></textarea>
+      <details id="extDetails">
+        <summary>Untrusted external context (optional)</summary>
+        <label for="source">Source label</label>
+        <input id="source" maxlength="100" value="pasted-note">
+        <textarea id="external" maxlength="10000" placeholder="Paste a job posting or recruiter email. It is treated as data, never as instructions."></textarea>
+      </details>
+      <details id="arenaDetails">
+        <summary>Arena controls (fault injection, step budget)</summary>
+        <div class="row">
+          <label>Fault <select id="fault">
+            <option value="none">none</option>
+            <option value="tool_timeout">tool_timeout</option>
+            <option value="malformed_tool_output">malformed_tool_output</option>
+            <option value="invalid_agent_decision">invalid_agent_decision</option>
+          </select></label>
+          <label>Max steps <input id="maxSteps" type="number" min="1" max="6" value="6"></label>
+          <label class="check"><input id="stateless" type="checkbox"> Send to stateless <code>/arena/run</code> (no memory, fresh board)</label>
+        </div>
+      </details>
+      <button id="send">Send</button>
+    </form>
+  </section>
+  <aside>
+    <h2>Run status</h2>
+    <p id="status" role="status" class="badge idle">idle</p>
+    <p id="meta" class="muted">session · 0 messages in memory</p>
+    <h2>Action timeline</h2>
+    <ol id="timeline" class="timeline"><li class="muted">No run yet.</li></ol>
+    <h2>Tool observations</h2>
+    <div id="observations" class="muted">No observations yet.</div>
+    <h2>Sandbox board <span class="muted small">(this chat)</span></h2>
+    <div id="board" class="muted">Loads after the first message.</div>
+    <details><summary>Raw response JSON</summary><pre id="raw">—</pre></details>
+  </aside>
+</main>
+<footer>Conversation memory and the sandbox board live in server memory and reset on restart or “New chat”. Never paste secrets.</footer>
+<script src="/static/app.js"></script>
 </body>
 </html>

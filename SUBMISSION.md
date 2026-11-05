@@ -1,26 +1,24 @@
 # Submission summary
-Replace placeholders with your details. Copy these details into your submission PDF.
 
 - Full name: Rayyan Khan
-- Roll number: [Your Roll Number, e.g., i221234]
-- Class / section: [Your Section]
-- University email: rayyankhancontact1@gmail.com
+- Roll number: TODO (e.g. i22xxxx)
+- Class / section: TODO
+- University email: TODO (university address)
 - GitHub username: rayyankhan33
-- Agent name and domain: JobTracker — Job-Application Tracker
-- Private GitHub repository URL: https://github.com/rayyankhan33/student-agent
-- Final source commit hash: 13159bff66c200e66033d6828f48445a911bb243
-- Working public agent interface URL: https://jobtracker-arena.onrender.com/
-- GET /health URL: https://jobtracker-arena.onrender.com/health
-- POST /arena/run URL: https://jobtracker-arena.onrender.com/arena/run
-- GET /arena/manifest URL: https://jobtracker-arena.onrender.com/arena/manifest
-- API documentation URL: https://jobtracker-arena.onrender.com/docs
-- Hosting provider: Render
-- Default model and provider: gemini-2.5-flash (Google Gemini)
-- Other available models: None
-- Example input and expected behavior: Input: "Show me all my job applications" -> Returns formatted list of all 8 tracked applications with IDs, statuses, and dates.
-- Cold-start / restart limitations: Free tier sleeps on inactivity (~50s cold-start). In-memory job board and conversation history reset upon server restart.
-- Instructor repository invitation status: Pending / Invited
-- Public test result file: evaluation/public_cases.json
-
-Submit [roll_number].zip and [roll_number]_submission.pdf in Google Classroom, then click Turn in.
-The ZIP must contain one [roll_number]/ project folder including this file. See assignment Section 19.
+- Agent name: JobTracker
+- Domain: Job-Application Tracker (#7)
+- GitHub repository URL: https://github.com/rayyankhan33/student-agent
+- Final commit hash: TODO (run `git rev-parse HEAD` after the final push)
+- Working agent interface: https://jobtracker-arena.onrender.com/
+- Health endpoint (GET): https://jobtracker-arena.onrender.com/health
+- Arena endpoint (POST): https://jobtracker-arena.onrender.com/arena/run
+- Manifest endpoint (GET): https://jobtracker-arena.onrender.com/arena/manifest
+- API documentation: https://jobtracker-arena.onrender.com/docs
+- Hosting provider: Render (free web service, 1 worker)
+- Default model / provider: gemini-3.1-flash-lite (Google Gemini via langchain-google-genai)
+- Other available models: gemini-3.5-flash-lite, gemini-2.5-flash (also used, in order, as automatic failover)
+- Example input: "Move my Microsoft application to screening"
+- Expected result: `completed / goal_completed`; `search_applications` finds app-002, then `update_status` moves it (applied → screening) and the board shows the new status.
+- Cold-start / restart limitations: the free instance sleeps when idle (first request takes about 50 s). Chat history and session boards are in memory and reset on restart or redeploy. Arena runs are stateless.
+- Repository access: TODO (instructor invited / accepted)
+- Public test results: evaluation/results/ (public_results_*.json, model_comparison.md/json, multiturn_*.json)
